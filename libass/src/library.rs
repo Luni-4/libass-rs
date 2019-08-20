@@ -1,9 +1,12 @@
 use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
+use std::os::raw::c_void;
 use std::ptr;
 use std::ptr::NonNull;
 use std::slice;
+use std::panic;
+use std::process;
 
 use libass_sys as ffi;
 
@@ -47,6 +50,56 @@ impl<'a> Library<'a> {
 
     pub fn set_extract_fonts(&mut self, extract: bool) {
         unsafe { ffi::ass_set_extract_fonts(self.handle.as_ptr(), extract as c_int) }
+    }
+
+    pub fn set_message_cb<F>(&mut self, callback: F, value: &mut Option<usize>)
+    where
+        F: FnMut(usize, &str, Option<&mut usize>) + 'static,
+    {
+        struct CallbackData<'a> {
+            callback: Box< dyn
+                FnMut(usize, &str, Option<&mut usize>) + 'static,
+            >,
+            value: &'a mut Option<usize>,
+        }
+
+        unsafe extern "C" fn message_callback(
+            level: i32,
+            fmt: *const i8,
+            _args: *mut ffi::__va_list_tag,
+            data: *mut c_void,
+        ) {
+            let mut user_data = Box::from_raw(data as *mut CallbackData);
+
+            let closure = panic::AssertUnwindSafe(|| {
+                let fmt_str = CStr::from_ptr(fmt).to_str().unwrap();
+
+                (user_data.callback)(
+                    level as usize,
+                    fmt_str,
+                    user_data.value.as_mut(),
+                )
+            });
+
+            if panic::catch_unwind(closure).is_err() {
+                process::abort();
+            }
+
+            Box::leak(user_data);
+        }
+
+        let user_data = Box::new(CallbackData {
+            callback: Box::new(callback),
+            value,
+        });
+
+        unsafe {
+            ffi::ass_set_message_cb(
+                self.handle.as_ptr(),
+                Some(message_callback),
+                Box::into_raw(user_data) as *mut c_void,
+            )
+        }
     }
 
     pub fn set_style_overrides(&mut self, list: &[&CStr]) {
